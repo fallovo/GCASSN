@@ -8,109 +8,211 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 
-class Trans_Net(nn.Module):
-    def __init__(self, args):
-        super(Trans_Net, self).__init__()
-        self.args = args
-        self.k = args.k
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-
-        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
-                                   self.bn1,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv2 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False),
-                                   self.bn2,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv3 = nn.Sequential(nn.Conv1d(128, 1024, kernel_size=1, bias=False),
-                                   self.bn3,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.linear1 = nn.Linear(1024, 512, bias=False)
-        self.bn3 = nn.BatchNorm1d(512)
-        self.linear2 = nn.Linear(512, 256, bias=False)
-        self.bn4 = nn.BatchNorm1d(256)
-        self.sa1 = SA_Layer(128)
-        self.transform = nn.Linear(256, 3 * 3)
-        init.constant_(self.transform.weight, 0)
-        init.eye_(self.transform.bias.view(3, 3))
-    def forward(self, x):
-        batch_size = x.size(0)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = x.max(dim=-1, keepdim=False)[0]
-        x = self.sa1(x)
-
-        x = self.conv3(x)
-        x = x.max(dim=-1, keepdim=False)[0]
-
-        x = F.leaky_relu(self.bn3(self.linear1(x)), negative_slope=0.2)
-        x = F.leaky_relu(self.bn4(self.linear2(x)), negative_slope=0.2)
-
-        x = self.transform(x)
-        x = x.view(batch_size, 3, 3)
-
-        return x
 def knn(x, k):
+    """
+        计算点云中每个点的k最近邻索引（使用平方欧氏距离计算）
+
+        参数:
+            x: 输入点云张量，形状为 [batch_size, feature_dim, num_points]
+            k: 要选择的最近邻数量
+
+        返回:
+            idx: 每个点的k最近邻索引，形状为 [batch_size, num_points, k]
+        """
+    # 计算内积矩阵
     inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    # 计算每个点的平方和
     xx = torch.sum(x ** 2, dim=1, keepdim=True)
+    #计算平方欧氏距离的负值-（ x^2 - 2xy + y^2）
     pairwise_distance = -xx - inner - xx.transpose(2, 1)
+    # 获取距离最大的k个索引（因为距离的负值最大 = 实际距离最小）
     idx = pairwise_distance.topk(k=k, dim=-1)[1]
     return idx
 def get_graph(x, k=20, idx=None, dim9=False):
+    """
+       构建点云图结构特征（用于局部特征提取）
+
+       参数:
+           x: 输入点云特征，形状为 [batch_size, feature_dim, num_points]
+           k: 邻居点数量，默认为20
+           idx: 预计算的邻居索引（可选），如未提供则重新计算
+           dim9: 布尔值，若为True则仅使用最后3个特征维度计算KNN（针对9维输入的特殊处理）
+
+       返回:
+           图特征张量，形状为 [batch_size, 2*feature_dim, num_points, k]
+       """
+    # 获取输入张量的维度信息
     batch_size = x.size(0)
     num_points = x.size(2)
     x = x.view(batch_size, -1, num_points)
+    # 计算KNN邻居索引（如果未提供）
     if idx is None:
         if dim9 == False:
             idx = knn(x, k=k)
         else:
             idx = knn(x[:, 6:], k=k)
     device = torch.device('cuda')
+    # 创建batch索引基础张量，用于跨batch的索引计算
     idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
+    # 将KNN索引扩展到完整batch范围
     idx = idx + idx_base
+    # 展平索引为1D向量
     idx = idx.view(-1)
     _, num_dims, _ = x.size()
+    # 调整特征张量维度
     x = x.transpose(2,1).contiguous()
+    # 获取邻居特征:
+    # 1. 展平特征为 [B*N, C]
+    # 2. 使用idx索引获取所有邻居点特征 [B*N*k, C]
+    # 3. 重塑为 [B, N, k, C]
     feature = x.view(batch_size * num_points, -1)[idx, :]
     feature = feature.view(batch_size, num_points, k, num_dims)
+    # 准备中心点特征（每个点重复k次）:
+    # 1. 将中心点重塑为 [B, N, 1, C]
+    # 2. 沿第三维重复k次 -> [B, N, k, C]
     x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+    # 构建图特征:
+    # 1. 拼接相对特征(邻居-中心)和绝对特征(中心)
+    # 2. 调整维度顺序: [B, N, k, 2*C] -> [B, 2*C, N, k]
     feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
     return feature
 
 class SA_Layer(nn.Module):
+    """自注意力层(Self-Attention Layer)，用于全局特征整合"""
     def __init__(self, channels):
+        """
+               参数:
+                   channels: 输入特征通道数
+        """
         super(SA_Layer, self).__init__()
+        # 查询向量变换: channels -> channels//4
         self.q_conv = nn.Conv1d(channels, channels // 4, 1, bias=False)
+        # 键向量变换: channels -> channels//4 (与q_conv共享权重)
         self.k_conv = nn.Conv1d(channels, channels // 4, 1, bias=False)
+        # 权重共享: 使查询和键使用相同的变换
         self.q_conv.weight = self.k_conv.weight
         self.q_conv.bias = self.k_conv.bias
+        # 值向量变换: channels -> channels
         self.v_conv = nn.Conv1d(channels, channels, 1)
+        # 注意力后的变换层
         self.trans_conv = nn.Conv1d(channels, channels, 1)
+        # 归一化层
         self.after_norm = nn.BatchNorm1d(channels)
+        # 激活函数
         self.act = nn.ReLU()
+        # Softmax用于计算注意力权重
         self.softmax = nn.Softmax(dim=-1)
     def forward(self, x):
+        """
+                前向传播
+
+                参数:
+                    x: 输入张量，形状为 [batch_size, channels, num_points]
+
+                返回:
+                    增强后的特征，形状与输入相同
+        """
+        # 计算查询向量 (Q)
         x_q = self.q_conv(x).permute(0, 2, 1)
+        # 计算键向量 (K)
         x_k = self.k_conv(x)
+        # 计算值向量 (V)
         x_v = self.v_conv(x)
+        # 计算注意力得分: Q * K^T
         energy = torch.bmm(x_q, x_k)
+        # 应用Softmax获取注意力权重
         attention = self.softmax(energy)
+        # 稳定注意力权重
         attention = attention / (1e-9 + attention.sum(dim=1, keepdim=True))
+        # 注意力加权聚合: V * 注意力权重
         x_r = torch.bmm(x_v, attention)
+        #进行拉普拉斯变换、增强特征表达
         x_r = self.act(self.after_norm(self.trans_conv(x - x_r)))
+        # 残差连接
         x = x + x_r
+        return x
+
+class Trans_Net(nn.Module):
+    """变换网络，用于学习3x3变换矩阵"""
+    def __init__(self, args):
+        super(Trans_Net, self).__init__()
+        self.args = args
+        self.k = args.k # 邻居点数量
+        # 批归一化层
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        # 卷积层1：6通道输入 -> 64通道输出
+        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   self.bn1,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        # 卷积层2：64通道 -> 128通道
+        self.conv2 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False),
+                                   self.bn2,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        # 卷积层3：128通道 -> 1024通道（转换为1D卷积）
+        self.conv3 = nn.Sequential(nn.Conv1d(128, 1024, kernel_size=1, bias=False),
+                                   self.bn3,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        # 全连接层
+        self.linear1 = nn.Linear(1024, 512, bias=False)
+        self.bn3 = nn.BatchNorm1d(512)
+        self.linear2 = nn.Linear(512, 256, bias=False)
+        self.bn4 = nn.BatchNorm1d(256)
+        # 自注意力层
+        self.sa1 = SA_Layer(128)
+        # 生成3x3变换矩阵的线性层
+        self.transform = nn.Linear(256, 3 * 3)
+        init.constant_(self.transform.weight, 0)
+        init.eye_(self.transform.bias.view(3, 3))
+    def forward(self, x):
+        """前向传播
+                参数:
+                    x: 输入张量，形状为 [batch_size, 3*2, num_points, k]
+
+                返回:
+                    [batch_size, 3, 3] 的3x3变换矩阵
+        """
+        batch_size = x.size(0)
+
+        # 第一层卷积：6 -> 64
+        x = self.conv1(x)  # 输出: [batch_size, 64, num_points, k]
+        # 第二层卷积：64 -> 128
+        x = self.conv2(x)  # 输出: [batch_size, 128, num_points, k]
+        # 沿k维度取最大值 (局部特征聚合)
+        x = x.max(dim=-1, keepdim=False)[0]  # 输出: [batch_size, 128, num_points]
+        # 自注意力层（处理点云序列）
+        x = self.sa1(x)  # 输出: [batch_size, 128, num_points]
+        # 第三层卷积：128 -> 1024 (1D卷积)
+        x = self.conv3(x)  # 输出: [batch_size, 1024, num_points]
+        # 全局最大池化（沿点维度）
+        x = x.max(dim=-1, keepdim=False)[0]  # 输出: [batch_size, 1024]
+        # 全连接层1 + 激活
+        x = F.leaky_relu(self.bn3_fc(self.linear1(x)), negative_slope=0.2)  # 输出: [batch_size, 512]
+        # 全连接层2 + 激活
+        x = F.leaky_relu(self.bn4(self.linear2(x)), negative_slope=0.2)  # 输出: [batch_size, 256]
+        # 生成变换矩阵参数
+        x = self.transform(x)  # 输出: [batch_size, 9]
+        # 重塑为3x3矩阵
+        x = x.view(batch_size, 3, 3)  # 输出: [batch_size, 3, 3]
         return x
 
 
 class GCASSN(nn.Module):
+    """图卷积自注意力协同分割网络"""
     def __init__(self, args, seg_num_all):
+        """
+               参数:
+                   args: 配置参数对象
+                   seg_num_all: 分割类别总数
+        """
         super(GCASSN, self).__init__()
         self.args = args
-        self.seg_num_all = seg_num_all
-        self.k = args.k
-        self.transform_net = Trans_Net(args)
+        self.seg_num_all = seg_num_all# 分割类别数
+        self.k = args.k # 邻居点数量
+        self.transform_net = Trans_Net(args)# 变换网络(学习点云的空间变换)
 
+        # 批量归一化层
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(64)
@@ -122,6 +224,7 @@ class GCASSN(nn.Module):
         self.bn9 = nn.BatchNorm1d(256)
         self.bn10 = nn.BatchNorm1d(128)
 
+        # 卷积层定义
         self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
                                    self.bn1,
                                    nn.LeakyReLU(negative_slope=0.2))
@@ -140,54 +243,73 @@ class GCASSN(nn.Module):
         self.conv6 = nn.Sequential(nn.Conv1d(1280+3, 256, kernel_size=1, bias=False),
                                    self.bn8,
                                    nn.LeakyReLU(negative_slope=0.2))
+        # 正则化层
         self.dp1 = nn.Dropout(p=args.dropout)
         self.conv7 = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1, bias=False),
                                    self.bn9,
                                    nn.LeakyReLU(negative_slope=0.2))
+        # 正则化层
         self.dp2 = nn.Dropout(p=args.dropout)
         self.conv8 = nn.Sequential(nn.Conv1d(256, 128, kernel_size=1, bias=False),
                                     self.bn10,
                                     nn.LeakyReLU(negative_slope=0.2))
         self.conv9 = nn.Conv1d(128, self.seg_num_all, kernel_size=1, bias=False)
-
+        # 自注意力层
         self.sa1 = SA_Layer(64)
         self.sa2 = SA_Layer(64)
         self.sa3 = SA_Layer(64)
     def forward(self, x, l):
+        """
+                前向传播
+
+                参数:
+                    x: 点云输入 [batch_size, 3, num_points]
+                    l: 类别标签嵌入 [batch_size, seg_num_all]
+
+                返回:
+                    分割预测 [batch_size, seg_num_all, num_points]
+        """
         batch_size = x.size(0)
         num_points = x.size(2)
 
+        # 阶段1: 空间变换对齐
+        # [B, N, 3] -> [B, 3, N] (变换后的点云)
         x0 = get_graph(x, k=self.k)
         t = self.transform_net(x0)
         x = x.transpose(2, 1)
         x = torch.bmm(x, t)
         x0 = x.transpose(2, 1)
-
+        # 第一层图卷积+自注意力
+        #[B, 3, N] -> [B, 64, N]
         x = get_graph(x0,k=self.k)
         x = self.conv1(x)
         x1 = x.max(dim=-1, keepdim=False)[0]
         x1 = self.sa1(x1)
 
+        # 第二层图卷积+自注意力
+        # [B, 3, N] -> [B, 64, N]
         x = get_graph(x1, k=self.k)
         x = self.conv2(x)
         x2 = x.max(dim=-1, keepdim=False)[0]
         x2 = self.sa2(x2)
 
+        # 第二层图卷积+自注意力
+        # [B, 3, N] -> [B, 64, N]
         x = get_graph(x2, k=self.k)
         x = self.conv3(x)
         x3 = x.max(dim=-1, keepdim=False)[0]
         x3 = self.sa3(x3)
 
+        # 多尺度特征融合
         x = torch.cat((x1, x2, x3), dim=1)
-
+        # 全局特征提取
         x = self.conv4(x)
         x = x.max(dim=-1, keepdim=True)[0]
-
         l = l.view(batch_size, -1, 1)
         l = self.conv5(l)
-
         x = torch.cat((x, l), dim=1)
         x = x.repeat(1, 1, num_points)
+        # 特征聚合
         x = torch.cat((x,x0, x1, x2, x3), dim=1)
 
         x = self.conv6(x)
